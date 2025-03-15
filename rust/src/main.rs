@@ -2,6 +2,7 @@ mod mono_injector;
 
 use reqwest;
 use std::{
+    collections::HashMap,
     env, fs,
     io::{self, Write},
     process::{Command, exit},
@@ -9,9 +10,10 @@ use std::{
     time::Duration,
 };
 use sysinfo::{ProcessExt, System, SystemExt};
-use serde_json::{Value, json};
+use serde_json::Value;
 use sha2::{Sha256, Digest};
 use std::path::Path;
+use std::fs::copy;
 use encoding_rs;
 
 #[cfg(target_os = "windows")]
@@ -38,20 +40,36 @@ fn main() {
     println!("  ╔───────────────────────────────────────────────────────────────╗");
     println!("  ║ Press Enter to begin injection process...                     ║");
     println!("  ╚───────────────────────────────────────────────────────────────╝");
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
+    let mut dummy = String::new();
+    io::stdin().read_line(&mut dummy).unwrap();
+
+    println!("  ┌───────────────────────────────────────────────────────────────┐");
+    print!("  │ Enter a GitHub version tag to use (or press Enter for latest):  ");
+    io::stdout().flush().unwrap();
+    let mut version_input = String::new();
+    io::stdin().read_line(&mut version_input).unwrap();
+    let version_input = version_input.trim();
+    println!("  └───────────────────────────────────────────────────────────────┘");
+    let version = if version_input.is_empty() {
+        let latest = get_latest_release();
+        println!("  [INFO] Latest cheat version found: {}", latest);
+        latest
+    } else {
+        println!("  [INFO] Using specified cheat version: {}", version_input);
+        version_input.to_string()
+    };
+
     print_info("Starting DarkRepoInjector...");
     let dest_dir = get_dest_dir();
     fs::create_dir_all(&dest_dir).expect("Failed to create directory");
-    let latest_version = get_latest_release();
-    println!("  [INFO] Latest cheat version found: {}", latest_version);
-    download_files_with_verification(&latest_version);
+
+    download_files_with_verification(&version);
     print_info("Waiting for REPO process...");
     wait_for_process("REPO");
     print_warning("REPO detected, waiting 10 seconds before injection...");
     thread::sleep(Duration::from_secs(10));
     print_info("Verifying stored hashes...");
-    verify_stored_hashes();
+    verify_stored_hashes(&version);
     print_info("Injecting DLL via custom Rust mono injector...");
     inject_dll_using_custom_injector(&dest_dir);
     print_injector_details();
@@ -63,15 +81,41 @@ fn main() {
     println!("  ┌───────────────────────────────────────────────────────────────┐");
     println!("  │ Thank you for using DarkRepoInjector                          │");
     println!("  │ Enjoy your enhanced REPO experience!                          │");
-    println!("  │ Closing in 5 seconds...                                       │");
+    println!("  │ Closing in 10 seconds...                                      │");
     println!("  └───────────────────────────────────────────────────────────────┘");
-    for i in (1..=5).rev() {
+    for i in (1..=10).rev() {
         print!("\r  Exiting in {} seconds...", i);
         io::stdout().flush().unwrap();
         thread::sleep(Duration::from_secs(1));
     }
     println!("\n\n  Goodbye!\n");
     thread::sleep(Duration::from_millis(500));
+}
+
+fn draw_progress_bar(percent: usize) {
+    if percent > 0 && percent < 100 && percent % 20 == 0 {
+        thread::sleep(Duration::from_millis(75));
+    }
+    let bar_width = 40;
+    let filled = (percent as f64 / 100.0 * bar_width as f64) as usize;
+    let empty = bar_width - filled;
+    let filled_bar = "█".repeat(filled);
+    let empty_bar = "░".repeat(empty);
+    let bar = format!("  │ [{}{}] {:3}% │", filled_bar, empty_bar, percent);
+    print!("\r{}", bar);
+    io::stdout().flush().unwrap();
+    if percent == 100 {
+        println!();
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn is_admin() -> bool {
+    let output = Command::new("net").arg("session").output();
+    match output {
+        Ok(o) => o.status.success(),
+        Err(_) => false,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -102,19 +146,8 @@ fn relaunch_as_admin() {
     }
 }
 
-fn is_admin() -> bool {
-    let output = Command::new("net").arg("session").output();
-    match output {
-        Ok(o) => o.status.success(),
-        Err(_) => false,
-    }
-}
-
 fn get_dest_dir() -> String {
-    env::current_dir()
-        .unwrap()
-        .to_string_lossy()
-        .to_string()
+    env::current_dir().unwrap().to_string_lossy().to_string()
 }
 
 fn display_banner() {
@@ -194,28 +227,76 @@ fn download_files_with_verification(version: &str) {
     print_box_line("Initializing download sequence...");
     thread::sleep(Duration::from_millis(300));
     let dest_dir = get_dest_dir();
-    let mut all_hashes = std::collections::HashMap::new();
-    for &file in FILES.iter() {
-        let url = format!("https://github.com/D4rkks/r.e.p.o-cheat/releases/download/{}/{}", version, file);
-        let dest_path = format!("{}\\{}", dest_dir, file);
-        if Path::new(&dest_path).exists() {
-            print_box_line(&format!("{} already exists. Skipping download.", file));
-            match calculate_file_hash(&dest_path) {
-                Ok(hash) => {
-                    all_hashes.insert(file.to_string(), hash.clone());
-                    animate_verified_hash(&hash);
-                },
-                Err(e) => {
-                    print_box_line(&format!("Error calculating hash for {}: {}", file, e));
-                }
-            }
-            continue;
+    let versioned_filename = format!("r.e.p.o.cheat_{}.dll", version);
+    let versioned_path = format!("{}\\{}", dest_dir, versioned_filename);
+    let injection_path = format!("{}\\r.e.p.o.cheat.dll", dest_dir);
+    let mut all_hashes: HashMap<String, String> = HashMap::new();
+    let hash_path = format!("{}\\{}", dest_dir, HASH_FILE);
+    let mut versions_map: HashMap<String, HashMap<String, String>> = if let Ok(content) = fs::read_to_string(&hash_path) {
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+    let current_hash = if Path::new(&versioned_path).exists() {
+        match calculate_file_hash(&versioned_path) {
+            Ok(h) => Some(h),
+            Err(_) => None,
         }
+    } else {
+        None
+    };
+    if let Some(stored_hashes) = versions_map.get(version) {
+        if let Some(stored_hash) = stored_hashes.get("r.e.p.o.cheat.dll") {
+            if let Some(ref file_hash) = current_hash {
+                if file_hash == stored_hash {
+                    print_box_line("r.e.p.o.cheat.dll already exists for current version. Skipping download.");
+                    animate_verified_hash(file_hash);
+                } else {
+                    download_file(version, &versioned_path);
+                }
+            } else {
+                download_file(version, &versioned_path);
+            }
+        } else {
+            download_file(version, &versioned_path);
+        }
+    } else {
+        download_file(version, &versioned_path);
+    }
+    let final_hash = match calculate_file_hash(&versioned_path) {
+        Ok(h) => h,
+        Err(e) => {
+            print_box_line(&format!("Error calculating hash after download: {}", e));
+            return;
+        }
+    };
+    let mut new_hash_entry: HashMap<String, String> = HashMap::new();
+    new_hash_entry.insert("r.e.p.o.cheat.dll".to_string(), final_hash.clone());
+    versions_map.insert(version.to_string(), new_hash_entry);
+    let hash_json = serde_json::to_string(&versions_map).unwrap_or_default();
+    match fs::write(&hash_path, hash_json) {
+        Ok(_) => {
+            print_box_line("Hash verification data saved successfully");
+        },
+        Err(e) => {
+            print_box_line(&format!("Failed to save verification data: {}", e));
+        }
+    }
+    animate_verified_hash(&final_hash);
+    if let Err(e) = copy(&versioned_path, &injection_path) {
+        print_box_line(&format!("Failed to copy file for injection: {}", e));
+    }
+    println!("  └─────────────────────────────────────────────────────────────────┘");
+}
+
+fn download_file(version: &str, dest_path: &str) {
+    for &file in FILES.iter() {
         print_box_line(&format!("Downloading: {}", file));
         thread::sleep(Duration::from_millis(250));
         let client = reqwest::blocking::Client::builder()
             .build()
             .expect("Failed to create secure client");
+        let url = format!("https://github.com/D4rkks/r.e.p.o-cheat/releases/download/{}/{}", version, file);
         match client.get(&url).send() {
             Ok(response) => {
                 if !response.status().is_success() {
@@ -223,15 +304,14 @@ fn download_files_with_verification(version: &str) {
                     continue;
                 }
                 let total_size = response.content_length().unwrap_or(0);
-                let mut file_handle = match fs::File::create(&dest_path) {
-                    Ok(file_handle) => file_handle,
+                let mut file_handle = match fs::File::create(dest_path) {
+                    Ok(f) => f,
                     Err(e) => {
                         print_box_line(&format!("Failed to create file: {}", e));
                         continue;
                     }
                 };
                 let mut hasher = Sha256::new();
-                let mut downloaded: u64 = 0;
                 match response.bytes() {
                     Ok(bytes) => {
                         let content = bytes.as_ref();
@@ -240,11 +320,10 @@ fn download_files_with_verification(version: &str) {
                             print_box_line(&format!("Failed to write file: {}", e));
                             continue;
                         }
-                        downloaded = content.len() as u64;
-                        let percent = if total_size > 0 { (downloaded * 100) / total_size } else { 100 };
-                        for p in (0..=percent as usize).step_by(10) {
+                        let percent = if total_size > 0 { ((content.len() as u64) * 100 / total_size) as usize } else { 100 };
+                        for p in (0..=percent).step_by(10) {
                             draw_progress_bar(p);
-                            if p < percent as usize {
+                            if p < percent {
                                 thread::sleep(Duration::from_millis(50));
                             }
                         }
@@ -254,44 +333,11 @@ fn download_files_with_verification(version: &str) {
                         continue;
                     }
                 }
-                let hash_result = hasher.finalize();
-                let hash = hash_result.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-                all_hashes.insert(file.to_string(), hash.clone());
-                animate_verified_hash(&hash);
             },
             Err(e) => {
                 print_box_line(&format!("Connection error: {}", e));
             }
         }
-    }
-    let hash_path = format!("{}\\{}", dest_dir, HASH_FILE);
-    let hash_json = serde_json::to_string(&all_hashes).unwrap_or_default();
-    match fs::write(&hash_path, hash_json) {
-        Ok(_) => {
-            print_box_line("Hash verification data saved successfully");
-        },
-        Err(e) => {
-            print_box_line(&format!("Failed to save verification data: {}", e));
-        }
-    }
-    println!("  └─────────────────────────────────────────────────────────────────┘");
-}
-
-fn draw_progress_bar(percent: usize) {
-    if percent > 0 && percent < 100 && percent % 20 == 0 {
-        thread::sleep(Duration::from_millis(75));
-    }
-    let bar_width = 40;
-    let filled = (percent as f64 / 100.0 * bar_width as f64) as usize;
-    let empty = bar_width - filled;
-    let filled_bar = "█".repeat(filled);
-    let empty_bar = "░".repeat(empty);
-    let bar = format!("  │ [{}{}] {:3}% │", filled_bar, empty_bar, percent);
-    print!("\r{}", bar);
-    io::stdout().flush().unwrap();
-    if percent == 100 {
-        println!();
-        thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -299,24 +345,35 @@ fn calculate_file_hash(file_path: &str) -> Result<String, io::Error> {
     let data = fs::read(file_path)?;
     let mut hasher = Sha256::new();
     hasher.update(&data);
-    let result = hasher.finalize();
-    let hex_string = result.iter().map(|b| format!("{:02x}", b)).collect::<String>();
-    Ok(hex_string)
+    Ok(result_to_hex_string(hasher.finalize()))
 }
 
-fn verify_stored_hashes() {
+fn result_to_hex_string(result: impl IntoIterator<Item = u8>) -> String {
+    result.into_iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn verify_stored_hashes(version: &str) {
     let dest_dir = get_dest_dir();
     let hash_path = format!("{}\\{}", dest_dir, HASH_FILE);
-    let stored_hashes: std::collections::HashMap<String, String> = match fs::read_to_string(&hash_path) {
-        Ok(content) => match serde_json::from_str(&content) {
-            Ok(map) => map,
-            Err(_) => {
-                print_error("Failed to parse stored hash data");
-                return;
+    let versions_map: HashMap<String, HashMap<String, String>> = match fs::read_to_string(&hash_path) {
+        Ok(content) => {
+            match serde_json::from_str(&content) {
+                Ok(map) => map,
+                Err(_) => {
+                    print_error("Failed to parse stored hash data");
+                    return;
+                }
             }
         },
         Err(_) => {
             print_error("No stored hash data found");
+            return;
+        }
+    };
+    let stored_hashes = match versions_map.get(version) {
+        Some(map) => map,
+        None => {
+            print_error("No stored hash data for the specified version");
             return;
         }
     };
@@ -363,10 +420,10 @@ fn verify_stored_hashes() {
         println!("  ╚══════════════════════════════════════════════════════════════════╝");
     } else {
         println!("\n");
-        println!("  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓");
+        println!("  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓");
         print_box_line("⚠️  Some files failed verification! Use caution.");
         print_box_line("Files may have been tampered with since download.");
-        println!("  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓");
+        println!("  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓");
     }
 }
 
@@ -399,10 +456,7 @@ fn inject_dll_using_custom_injector(dest_dir: &str) {
     println!("  │ Target: REPO process                                          │");
     println!("  │ Method: MonoLoader.dll                                        │");
     println!("  └───────────────────────────────────────────────────────────────┘");
-    let mono_loader_path = std::env::current_dir().unwrap()
-        .join("MonoLoader.dll")
-        .to_string_lossy()
-        .to_string();
+    let mono_loader_path = std::env::current_dir().unwrap().join("MonoLoader.dll").to_string_lossy().to_string();
     println!("  ┌───────────────────────────────────────────────────────────────┐");
     print_box_line(&format!("DLL Path: {}", mono_loader_path));
     println!("  └───────────────────────────────────────────────────────────────┘");
@@ -433,16 +487,18 @@ fn inject_dll_using_custom_injector(dest_dir: &str) {
 }
 
 fn print_injector_details() {
-    let log_path = "injector_log.txt";
-    if let Ok(content) = fs::read_to_string(log_path) {
+    let appdata = env::var("APPDATA").unwrap_or_default();
+    let log_path = format!("{}\\MonoLoader.log", appdata);
+    if let Ok(content) = fs::read_to_string(&log_path) {
         let lines: Vec<&str> = content.lines().collect();
-        let count = lines.len();
-        println!("\n  ┌──────────── Injector Technical Details ────────────┐");
-        for line in lines.iter().skip(if count > 10 { count - 3 } else { 0 }) {
+        let total_lines = lines.len();
+        let start_index = if total_lines > 5 { total_lines - 5 } else { 0 };
+        println!("\n  ┌────── MonoLoader Log (last 5 lines) ───────┐");
+        for line in &lines[start_index..] {
             println!("  │ {}", line);
         }
-        println!("  └────────────────────────────────────────────────────────┘\n");
+        println!("  └────────────────────────────────────────────┘\n");
     } else {
-        println!("  [INFO] No injector log details available.");
+        println!("  [INFO] No MonoLoader log details available.");
     }
 }
