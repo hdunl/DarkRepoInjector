@@ -66,8 +66,8 @@ fn main() {
     download_files_with_verification(&version);
     print_info("Waiting for REPO process...");
     wait_for_process("REPO");
-    print_warning("REPO detected, waiting 10 seconds before injection...");
-    thread::sleep(Duration::from_secs(10));
+    print_warning("REPO detected, waiting 5 seconds before injection...");
+    thread::sleep(Duration::from_secs(5));
     print_info("Verifying stored hashes...");
     verify_stored_hashes(&version);
     print_info("Injecting DLL via custom Rust mono injector...");
@@ -492,8 +492,8 @@ fn print_injector_details() {
     if let Ok(content) = fs::read_to_string(&log_path) {
         let lines: Vec<&str> = content.lines().collect();
         let total_lines = lines.len();
-        let start_index = if total_lines > 5 { total_lines - 5 } else { 0 };
-        println!("\n  ┌────── MonoLoader Log (last 5 lines) ───────┐");
+        let start_index = if total_lines > 10 { total_lines - 10 } else { 0 };
+        println!("\n  ┌────── MonoLoader Log (last 10 lines) ───────┐");
         for line in &lines[start_index..] {
             println!("  │ {}", line);
         }
